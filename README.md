@@ -22,13 +22,41 @@ fail with `gitleaks: command not found`, tflint download timeouts, and missing
 
 ## Image reference
 
+The pipeline is **SemVer release-managed**. The source of truth for the version
+is the git tags `vX.Y.Z`; every build on `main` (push / daily schedule / manual
+dispatch) cuts a new **patch** and publishes the full tag set:
+
 ```
-ghcr.io/kadenz-live/ci:latest          # rolling, consumed by the Synology compose
-ghcr.io/kadenz-live/ci:sha-<gitsha>     # immutable, pin for reproducibility
+ghcr.io/kadenz-live/ci:vX.Y.Z          # immutable full version (also a git tag + GitHub Release)
+ghcr.io/kadenz-live/ci:X.Y             # minor float — auto-updates to the newest patch (Synology pins here)
+ghcr.io/kadenz-live/ci:X               # major float
+ghcr.io/kadenz-live/ci:latest          # newest release
+ghcr.io/kadenz-live/ci:sha-<gitsha>    # immutable, pin to an exact commit
 ```
 
 Built + pushed by [`.github/workflows/build.yml`](.github/workflows/build.yml)
-on every push to `main` (GitHub-hosted runner, `linux/amd64`).
+(GitHub-hosted runner, `linux/amd64`) on:
+
+- **push to `main`** (excluding `CHANGELOG.md`-only commits),
+- a **daily `03:00 UTC` schedule** (= 05:00 CEST / 04:00 CET — the cron is UTC,
+  so the Berlin wall-clock shifts by an hour across DST), which guarantees a
+  fresh patch every day so a runner restart picks up that day's base-image
+  security updates even with zero code change, and
+- **manual `workflow_dispatch`**.
+
+Each run also Cosign-keyless-signs the pushed digest, creates the `vX.Y.Z` git
+tag + a GitHub Release with auto-generated notes, and regenerates
+[`CHANGELOG.md`](CHANGELOG.md) via [git-cliff](https://git-cliff.org)
+([`cliff.toml`](cliff.toml)) committed back with `[skip ci]`.
+
+**Verify a signature** before trusting an image:
+
+```sh
+cosign verify \
+  --certificate-identity-regexp 'https://github.com/kadenz-live/kadenz-ci/.github/workflows/build.yml@.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/kadenz-live/ci:1.0
+```
 
 ## What's baked in
 
@@ -75,7 +103,8 @@ generic image to this one:
 ```yaml
 services:
   kadenz-ci-runner:
-    image: ghcr.io/kadenz-live/ci:latest          # was: myoung34/github-runner:latest
+    image: ghcr.io/kadenz-live/ci:1.0             # pin the MINOR float — patches 1.0.* auto-flow
+    pull_policy: always                           # re-pull the newest 1.0.x patch on every start
     network_mode: host                            # service-container ports reach the job
     restart: unless-stopped
     environment:
@@ -117,8 +146,12 @@ gh api -X POST repos/kadenz-live/kadenz/actions/runners/registration-token --jq 
 3. For apt-sourced tools (Node, gh, Playwright libs), the bump is implicit in
    the Ubuntu base-image digest — re-pin the `FROM ubuntu:24.04@sha256:...`
    digest deliberately when you want a refresh.
-4. Push to `main`; `build.yml` publishes a new `:latest` + `:sha-<gitsha>`.
-5. Re-pull on the Synology hosts (`docker compose pull && docker compose up -d`).
+4. Push to `main`; `build.yml` cuts a new patch `vX.Y.(Z+1)` and republishes
+   the `:X.Y` minor float (plus `:vX.Y.Z`, `:X`, `:latest`, `:sha-<gitsha>`).
+5. The Synology hosts pin the `:X.Y` minor float with `pull_policy: always`, so
+   a `docker compose up -d` / restart re-pulls the newest patch automatically —
+   no manual `docker compose pull` needed. Bumping to a new **minor** is a
+   deliberate pin change in the compose.
 
 ## Relationship to the bastion runner
 
@@ -132,9 +165,15 @@ bump one, bump the other.
 ## Supply-chain
 
 `build.yml` attaches SLSA build provenance (`provenance: mode=max`) and an SBOM
-(`sbom: true`) to the pushed image via buildkit. Keyless `cosign` signing is a
-documented **TODO** in the workflow (mirroring the Kadenz `release.yml` cosign
-pattern) — tracked for the public-repo flip.
+(`sbom: true`) to the pushed image via buildkit, then **Cosign keyless-signs**
+the pushed digest (Fulcio cert via the workflow OIDC token, signature recorded
+in the public Rekor transparency log). Verify with `cosign verify` as shown
+under [Image reference](#image-reference).
+
+GitHub security features on this repo: secret scanning + push protection,
+Dependabot alerts + automated security fixes, and a weekly Dependabot config
+([`.github/dependabot.yml`](.github/dependabot.yml)) that keeps the SHA-pinned
+action refs and the Dockerfile base-image digest current.
 
 ## License
 

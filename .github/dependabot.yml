@@ -1,0 +1,25 @@
+version: 2
+# Dependabot for the ci runner-image repo. Two ecosystems, weekly:
+#   - github-actions: keeps the SHA-pinned action refs in build.yml + any
+#     other workflow current (Dependabot bumps the pin AND the trailing
+#     version comment together).
+#   - docker: bumps the `FROM ubuntu:24.04@sha256:...` base-image digest in
+#     the Dockerfile so a base refresh is a reviewable PR, not silent drift.
+# Style mirrors kadenz-live/kadenz .github/dependabot.yml (labels + weekly
+# Monday cadence for infra ecosystems).
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    labels: ["deps", "ci"]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: ["deps", "docker"]

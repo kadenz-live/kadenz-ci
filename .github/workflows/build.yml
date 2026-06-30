@@ -1,6 +1,13 @@
 name: Build image
 
-# Builds + pushes the ci runner image to GHCR on every push to main.
+# Release-managed image pipeline for the `ci` self-hosted runner image.
+#
+# Builds + pushes ghcr.io/kadenz-live/ci on every push to main, on a daily
+# schedule (base-image security refresh), and on manual dispatch. Every run on
+# main cuts a NEW SemVer PATCH from the latest vX.Y.Z git tag (first run ->
+# v1.0.0), publishes the image with the full SemVer tag set, Cosign-signs the
+# pushed digest keyless, creates the git tag + a GitHub Release, and commits an
+# updated CHANGELOG.md back to main.
 #
 # Runs on GitHub-hosted `ubuntu-latest` ON PURPOSE: the self-hosted runners
 # this image powers are repo-scoped to kadenz-live/kadenz (not this repo), and
@@ -13,22 +20,40 @@ name: Build image
 on:
   push:
     branches: [main]
-    paths:
-      - "Dockerfile"
-      - "entrypoint.sh"
-      - ".github/workflows/build.yml"
-  # Manual rebuild path (e.g. after a base-image digest bump that didn't touch
-  # the watched paths, or to force-refresh :latest).
+    # CHANGELOG.md is committed back by the changelog job below using the
+    # default GITHUB_TOKEN. Pushes made with GITHUB_TOKEN do NOT re-trigger
+    # workflows (GitHub's documented loop-prevention), so a recursive build
+    # cannot happen. paths-ignore is belt-and-suspenders so that even a
+    # human commit that only touches CHANGELOG.md never cuts a release —
+    # combined with the `[skip ci]` marker on the bot commit.
+    paths-ignore:
+      - "CHANGELOG.md"
+  # Manual rebuild path (force a fresh patch, e.g. after a base-image digest
+  # bump, or to re-cut a release out of band).
   workflow_dispatch:
+  # Daily rebuild at 03:00 UTC. NOTE the UTC<->Berlin caveat: Europe/Berlin is
+  # UTC+2 in summer (CEST) and UTC+1 in winter (CET), so 03:00 UTC is 05:00
+  # CEST / 04:00 CET. GitHub cron is always UTC — there is no DST-following
+  # cron, so the wall-clock Berlin time shifts by an hour twice a year. 03:00
+  # UTC is chosen so the daily security-patch rebuild lands in the early
+  # German morning either way, before the working day. Every scheduled run
+  # cuts a fresh PATCH so a restart of the Synology runners picks up that
+  # day's base-image security updates even with zero code change.
+  schedule:
+    - cron: "0 3 * * *"
 
-# Least-privilege: read the repo, write the package. No other surface.
+# Workflow-level least-privilege baseline: read-only. Each job widens its own
+# scope explicitly below (contents: write for tags/releases/changelog,
+# packages: write for the push, id-token: write for Cosign keyless).
 permissions:
   contents: read
-  packages: write
 
 concurrency:
-  group: build-${{ github.ref }}
-  cancel-in-progress: true
+  # Serialize releases on main so two runs can't race to compute + claim the
+  # same next patch tag. No cancel-in-progress: a half-finished release (image
+  # pushed but tag/release not yet created) must be allowed to complete.
+  group: build-release
+  cancel-in-progress: false
 
 env:
   # Image name is `ci` (short), decoupled from the repo name `kadenz-ci`
@@ -39,16 +64,75 @@ env:
 
 jobs:
   build-and-push:
-    name: Build & push ci image
+    name: Build, push, sign & release ci image
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: write # create the vX.Y.Z tag + GitHub Release
+      packages: write # push the image to GHCR
+      # id-token: write is required for Cosign keyless signing: the workflow's
+      # OIDC token is exchanged with Fulcio for a short-lived signing cert
+      # bound to the repo + workflow path. Without it `cosign sign --yes`
+      # fails with "no OIDC token found".
+      id-token: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - name: Checkout (full history + tags)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # fetch-depth: 0 + tags so `git tag --sort=-v:refname` sees the full
+          # tag history to compute the next patch, and so the git-cliff
+          # changelog job has the commit range it needs.
+          fetch-depth: 0
+          fetch-tags: true
 
-      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+      - name: Compute next SemVer version
+        id: version
+        # Source of truth = git tags vX.Y.Z. Latest tag via
+        # `git tag --sort=-v:refname | head -1`. If none -> v1.0.0 (the
+        # bootstrap release that makes the :1.0 minor-float tag exist).
+        # Otherwise bump PATCH. Every build on main cuts a fresh patch; the
+        # daily schedule guarantees a new patch even with no code change.
+        run: |
+          set -euo pipefail
+          latest="$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)"
+          if [ -z "$latest" ]; then
+            version="v1.0.0"
+            echo "No existing vX.Y.Z tag — bootstrapping at ${version}."
+          else
+            # Strip leading v, split, bump patch.
+            core="${latest#v}"
+            major="${core%%.*}"
+            rest="${core#*.}"
+            minor="${rest%%.*}"
+            patch="${rest#*.}"
+            patch=$((patch + 1))
+            version="v${major}.${minor}.${patch}"
+            echo "Latest tag ${latest} -> next ${version}."
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Next version: \`${version}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Guard against an already-existing tag
+        # Defensive: if a previous run pushed the image + tag but died before
+        # finishing, re-running would try to re-create the same tag. Fail loud
+        # rather than clobber. (The serialized concurrency group makes this
+        # rare, but a cancelled mid-run can still leave a tag behind.)
+        run: |
+          set -euo pipefail
+          v="${{ steps.version.outputs.version }}"
+          if git rev-parse -q --verify "refs/tags/${v}" >/dev/null; then
+            echo "::error::Tag ${v} already exists locally — aborting to avoid clobber."
+            exit 1
+          fi
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -56,23 +140,33 @@ jobs:
 
       - name: Compute image metadata
         id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051  # v5.10.0
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ${{ env.IMAGE }}
-          # `latest` (mutable rolling tag the Synology compose consumes) plus
-          # an immutable `sha-<gitsha>` tag so any pull can be pinned exactly.
+          # The computed version is fed via value-overrides so the SemVer
+          # patterns work on push/schedule/dispatch identically (there is no
+          # git-tag event here — we cut the tag AFTER the build). This yields:
+          #   :vX.Y.Z  (immutable full version)
+          #   :X.Y     (minor float — the Synology runners pin to this)
+          #   :X       (major float)
+          #   :latest  (newest release)
+          #   :sha-<full-sha>
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.version }}
+            type=semver,pattern={{major}},value=${{ steps.version.outputs.version }}
+            type=raw,value=latest
             type=sha,prefix=sha-,format=long
           labels: |
             org.opencontainers.image.title=ci
             org.opencontainers.image.description=Self-hosted GitHub Actions runner image for the Kadenz CI pool (kadenz-ci label).
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
             org.opencontainers.image.licenses=MIT
 
       - name: Build & push
         id: build
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
           # amd64 only — bastion + Synology runners are x86_64. arm64 would
@@ -84,28 +178,107 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           # SLSA build provenance + SBOM attestations attached to the image.
-          # build-push-action wires these through buildkit natively — no extra
-          # syft/cosign steps needed for the attestation path.
+          # build-push-action wires these through buildkit natively.
           provenance: mode=max
           sbom: true
 
-      # TODO(cosign): add keyless cosign signing of the pushed digest, mirroring
-      # the `cosign sign --yes` / `cosign attest` steps in kadenz's release.yml.
-      # It needs `id-token: write` added to this job's permissions plus the
-      # sigstore/cosign-installer step. Deferred as non-trivial — the buildx
-      # `provenance: mode=max` + `sbom: true` attestations above already give
-      # SLSA provenance + an SBOM in the registry; cosign adds the Rekor-logged
-      # keyless signature on top. Track alongside the public-repo flip.
+      - name: Install cosign
+        # Pin cosign itself for reproducibility — stating the release explicitly
+        # survives future installer bumps without surprise version skew.
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.0.6
 
-      - name: Summarise published tags
+      - name: Cosign keyless sign image
+        # Keyless signing: cosign exchanges the workflow OIDC token with Fulcio
+        # for a short-lived signing cert (binds signature -> repo + workflow
+        # path + ref), writes the signature to GHCR alongside the image, and
+        # records it in the public Rekor transparency log. Signs the immutable
+        # digest, not a tag, so the signature is bound to the exact bytes
+        # pushed. This realises the documented cosign TODO and mirrors the
+        # kadenz release.yml keyless pattern.
+        env:
+          COSIGN_YES: "true"
+          IMAGE_DIGEST: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
         run: |
+          cosign sign --yes "$IMAGE_DIGEST"
+
+      - name: Create git tag + GitHub Release
+        # Tag the exact commit that was built, then publish a Release with
+        # auto-generated notes. `gh release create` creates the tag server-side
+        # when it does not yet exist, so no separate `git push` of the tag is
+        # needed — and it cannot recursively trigger this workflow (no
+        # `push: tags` trigger, and the default GITHUB_TOKEN does not re-fire
+        # workflows anyway).
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          gh release create "$VERSION" \
+            --target "${GITHUB_SHA}" \
+            --title "$VERSION" \
+            --generate-notes \
+            --notes-start-tag "$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || echo '')" \
+            --latest
           {
-            echo "### ci image published"
+            echo "### ci image released: \`${VERSION}\`"
             echo ""
-            echo "Digest: \`${{ steps.build.outputs.digest }}\`"
+            echo "Digest: \`${DIGEST}\`"
             echo ""
             echo "Tags:"
             echo '```'
             echo "${{ steps.meta.outputs.tags }}"
             echo '```'
+            echo ""
+            echo "Release: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${VERSION}"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  changelog:
+    name: Update CHANGELOG.md
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # commit the regenerated CHANGELOG.md back to main
+    steps:
+      - name: Checkout main (full history + tags)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: main
+          # Full history + the freshly-created tag so git-cliff can render the
+          # complete conventional-commit changelog.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Generate CHANGELOG.md with git-cliff
+        # git-cliff is the conventional-commit changelog standard. It renders
+        # the whole history (including the just-cut tag) into CHANGELOG.md.
+        # Config lives in cliff.toml at the repo root.
+        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5 # v4.8.0
+        with:
+          config: cliff.toml
+          args: --verbose
+        env:
+          OUTPUT: CHANGELOG.md
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Commit CHANGELOG.md back to main
+        # Commits with the default GITHUB_TOKEN do NOT recursively re-trigger
+        # workflows (documented GitHub loop-prevention). The `[skip ci]` marker
+        # + the `paths-ignore: [CHANGELOG.md]` on the push trigger are
+        # belt-and-suspenders so even a future token/PAT change can't loop.
+        env:
+          VERSION: ${{ needs.build-and-push.outputs.version }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- CHANGELOG.md; then
+            echo "CHANGELOG.md unchanged — nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          git commit -m "docs(changelog): update for ${VERSION} [skip ci]"
+          git push origin HEAD:main
