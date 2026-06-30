@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.9
 #
-# kadenz-ci — custom self-hosted GitHub Actions runner image for the Kadenz CI pool.
+# ci — custom self-hosted GitHub Actions runner image for the Kadenz CI pool.
 #
 # This image bakes the full toolchain the kadenz-live/kadenz workflows assume
 # pre-installed on a runner labelled `kadenz-ci`

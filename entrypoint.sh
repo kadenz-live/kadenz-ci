@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Entrypoint for the kadenz-ci self-hosted GitHub Actions runner image.
+# Entrypoint for the ci self-hosted GitHub Actions runner image.
 #
 # Registers the runner against a repository (repo-scoped, never org-scoped),
 # starts it, and de-registers gracefully on container stop. The env-var

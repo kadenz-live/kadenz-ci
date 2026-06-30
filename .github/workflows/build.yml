@@ -1,6 +1,6 @@
 name: Build image
 
-# Builds + pushes the kadenz-ci runner image to GHCR on every push to main.
+# Builds + pushes the ci runner image to GHCR on every push to main.
 #
 # Runs on GitHub-hosted `ubuntu-latest` ON PURPOSE: the self-hosted runners
 # this image powers are repo-scoped to kadenz-live/kadenz (not this repo), and
@@ -31,11 +31,15 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE: ghcr.io/${{ github.repository }}
+  # Image name is `ci` (short), decoupled from the repo name `kadenz-ci`
+  # on purpose — Yves wants the repo to stay kadenz-ci but the published
+  # image to be just `ghcr.io/kadenz-live/ci`. Hardcoded (not
+  # ${{ github.repository }}) so the rename of the repo does not move it.
+  IMAGE: ghcr.io/kadenz-live/ci
 
 jobs:
   build-and-push:
-    name: Build & push kadenz-ci image
+    name: Build & push ci image
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -61,7 +65,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=sha-,format=long
           labels: |
-            org.opencontainers.image.title=kadenz-ci
+            org.opencontainers.image.title=ci
             org.opencontainers.image.description=Self-hosted GitHub Actions runner image for the Kadenz CI pool (kadenz-ci label).
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.licenses=MIT
@@ -96,7 +100,7 @@ jobs:
       - name: Summarise published tags
         run: |
           {
-            echo "### kadenz-ci image published"
+            echo "### ci image published"
             echo ""
             echo "Digest: \`${{ steps.build.outputs.digest }}\`"
             echo ""

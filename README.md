@@ -1,6 +1,7 @@
 # kadenz-ci
 
 Custom self-hosted **GitHub Actions runner image** for the Kadenz CI pool.
+Published as **`ghcr.io/kadenz-live/ci`** (short image name; this repo stays `kadenz-ci`).
 
 It bakes the full toolchain that the [`kadenz-live/kadenz`](https://github.com/kadenz-live/kadenz)
 workflows assume is pre-installed on a runner labelled `kadenz-ci`
@@ -22,8 +23,8 @@ fail with `gitleaks: command not found`, tflint download timeouts, and missing
 ## Image reference
 
 ```
-ghcr.io/kadenz-live/kadenz-ci:latest          # rolling, consumed by the Synology compose
-ghcr.io/kadenz-live/kadenz-ci:sha-<gitsha>     # immutable, pin for reproducibility
+ghcr.io/kadenz-live/ci:latest          # rolling, consumed by the Synology compose
+ghcr.io/kadenz-live/ci:sha-<gitsha>     # immutable, pin for reproducibility
 ```
 
 Built + pushed by [`.github/workflows/build.yml`](.github/workflows/build.yml)
@@ -74,7 +75,7 @@ generic image to this one:
 ```yaml
 services:
   kadenz-ci-runner:
-    image: ghcr.io/kadenz-live/kadenz-ci:latest   # was: myoung34/github-runner:latest
+    image: ghcr.io/kadenz-live/ci:latest          # was: myoung34/github-runner:latest
     network_mode: host                            # service-container ports reach the job
     restart: unless-stopped
     environment:
