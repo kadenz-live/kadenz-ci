@@ -73,6 +73,13 @@ RUN set -eux; \
       tar \
       xz-utils \
       sudo \
+      # gosu drops from the root entrypoint phase to the non-root runner user
+      # after the docker-socket GID grant (see entrypoint.sh). Preferred over
+      # `su`/`sudo` for an exec-style, signal-transparent privilege drop — the
+      # runner stays PID-traceable so the SIGTERM de-register trap still fires.
+      # apt (noble universe) keeps it patched via the base-image refresh; no
+      # separate SHA pin to maintain.
+      gosu \
       # --- JS-based composite actions (setup-terraform wrapper, setup-tflint,
       #     actions/cache, upload-artifact) shell out to a system node + unzip ---
       nodejs \
@@ -222,9 +229,25 @@ RUN set -eux; \
 COPY --chown=${RUNNER_USER}:${RUNNER_USER} entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod 0755 /usr/local/bin/entrypoint.sh
 
-USER ${RUNNER_USER}
 WORKDIR ${RUNNER_HOME}/actions-runner
 
+# The container starts as ROOT — but ONLY for a brief setup phase. The
+# entrypoint:
+#   1. inspects the bind-mounted /var/run/docker.sock, creates a host-matching
+#      group for its GID, and adds `runner` to it (so the non-root runner can
+#      talk to the host Docker daemon — RSpec self-manages postgres/redis via
+#      `docker run` since kadenz#902), then
+#   2. immediately drops to the unprivileged `runner` user via `gosu` and execs
+#      the runner.
+# The runner job process therefore NEVER runs as root (RUNNER_ALLOW_RUNASROOT
+# is intentionally left unset/off) — root exists only long enough to perform
+# the GID grant that a Dockerfile-time chown cannot (the socket's host GID is
+# unknowable until the bind-mount is present at container start).
+#
+# Bake the runner user name into the image env so the entrypoint knows which
+# user to gosu-drop to without re-deriving it from /etc/passwd.
+ENV RUNNER_USER=${RUNNER_USER}
+
 # Graceful de-registration on container stop is handled inside entrypoint.sh
-# via a SIGTERM/SIGINT trap.
+# via a SIGTERM/SIGINT trap, which is preserved across the gosu drop.
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
