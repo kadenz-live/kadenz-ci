@@ -1,0 +1,7 @@
+# Only the Dockerfile + entrypoint are needed in the build context.
+# Exclude everything else so docs/CI changes don't bust the build cache.
+.git
+.github
+*.md
+LICENSE
+.gitignore

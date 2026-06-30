@@ -1,0 +1,107 @@
+name: Build image
+
+# Builds + pushes the kadenz-ci runner image to GHCR on every push to main.
+#
+# Runs on GitHub-hosted `ubuntu-latest` ON PURPOSE: the self-hosted runners
+# this image powers are repo-scoped to kadenz-live/kadenz (not this repo), and
+# a half-built image can't bootstrap the runner that would build its successor.
+# Keep this job GitHub-hosted so the image pipeline is always self-contained.
+#
+# Action SHA-pinning + permissions hardening mirror kadenz-live/kadenz's
+# .github/workflows/release.yml.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - "entrypoint.sh"
+      - ".github/workflows/build.yml"
+  # Manual rebuild path (e.g. after a base-image digest bump that didn't touch
+  # the watched paths, or to force-refresh :latest).
+  workflow_dispatch:
+
+# Least-privilege: read the repo, write the package. No other surface.
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build-and-push:
+    name: Build & push kadenz-ci image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051  # v5.10.0
+        with:
+          images: ${{ env.IMAGE }}
+          # `latest` (mutable rolling tag the Synology compose consumes) plus
+          # an immutable `sha-<gitsha>` tag so any pull can be pinned exactly.
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=long
+          labels: |
+            org.opencontainers.image.title=kadenz-ci
+            org.opencontainers.image.description=Self-hosted GitHub Actions runner image for the Kadenz CI pool (kadenz-ci label).
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=MIT
+
+      - name: Build & push
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          # amd64 only — bastion + Synology runners are x86_64. arm64 would
+          # only pay off for an arm runner host, of which there are none.
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # SLSA build provenance + SBOM attestations attached to the image.
+          # build-push-action wires these through buildkit natively — no extra
+          # syft/cosign steps needed for the attestation path.
+          provenance: mode=max
+          sbom: true
+
+      # TODO(cosign): add keyless cosign signing of the pushed digest, mirroring
+      # the `cosign sign --yes` / `cosign attest` steps in kadenz's release.yml.
+      # It needs `id-token: write` added to this job's permissions plus the
+      # sigstore/cosign-installer step. Deferred as non-trivial — the buildx
+      # `provenance: mode=max` + `sbom: true` attestations above already give
+      # SLSA provenance + an SBOM in the registry; cosign adds the Rekor-logged
+      # keyless signature on top. Track alongside the public-repo flip.
+
+      - name: Summarise published tags
+        run: |
+          {
+            echo "### kadenz-ci image published"
+            echo ""
+            echo "Digest: \`${{ steps.build.outputs.digest }}\`"
+            echo ""
+            echo "Tags:"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
