@@ -83,6 +83,10 @@ RUN set -eux; \
       # --- JS-based composite actions (setup-terraform wrapper, setup-tflint,
       #     actions/cache, upload-artifact) shell out to a system node + unzip ---
       nodejs \
+      # sigstore/cosign-installer shells out to envsubst at install time
+      # (release.yml "Install cosign" step on kadenz-build jobs); gettext-base
+      # ships envsubst without pulling in the full gettext toolchain.
+      gettext-base \
       # --- native-gem build chain. Ruby itself is provided per-job by
       #     ruby/setup-ruby; these are the headers/libs its native gems
       #     (pg, psych/libyaml, ffi, nokogiri, bcrypt, ...) compile against ---
