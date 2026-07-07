@@ -68,6 +68,7 @@ the bastion runner, so the two stay in lock-step:
 | actions/runner | `2.335.1` (SHA-256 pinned) | `roles/github_runner/defaults/main.yml` | The runner agent itself; matches the bastion. |
 | gitleaks | `8.21.2` (SHA-256 pinned) | `roles/runner_gitleaks/defaults/main.yml` | `gitleaks.yml` runs the binary directly. |
 | hcloud CLI | `1.66.0` (SHA-256 pinned) | `roles/runner_toolchain/defaults/main.yml` | `ansible.yml` discovers Hetzner server IPs. |
+| trivy | `0.72.0` (SHA-256 pinned) | `roles/runner_toolchain/defaults/main.yml` | Pre-installed so `trivy` resolves on PATH baseline; see the caveat below and [kadenz#1186](https://github.com/kadenz-live/kadenz/issues/1186). |
 | Docker CLI + buildx + compose plugins | apt (noble `stable`) | — | Service containers (`api.yml`) + image builds (`release.yml`). Daemon is host-provided. |
 | Node.js | apt (Ubuntu noble) | `roles/runner_toolchain/defaults/main.yml` | JS composite actions (`setup-terraform` wrapper, `setup-tflint`) need a system `node`. |
 | gh CLI | apt (cli/cli upstream) | `roles/runner_toolchain/defaults/main.yml` | `gh workflow run` in release deploy + Dependabot auto-merge cron. |
@@ -90,10 +91,17 @@ so baking them would be redundant or would fight the version the workflow pins:
   pins it (`frontend.yml`, `e2e.yml`).
 - **ansible-core `2.18.*` / ansible-lint `25.5.0`** — in-workflow `pip install`.
 - **sops `3.13.1`** — in-workflow download (`ansible.yml`).
-- **checkov, trivy, cosign, syft** — run as **Docker action containers**
-  (`bridgecrewio/checkov-action`, `aquasecurity/trivy-action`,
-  `sigstore/cosign-installer`, `anchore/sbom-action`). They need the Docker CLI
-  + daemon (provided), not host installs.
+- **checkov, cosign, syft** — run as **Docker action containers**
+  (`bridgecrewio/checkov-action`, `sigstore/cosign-installer`,
+  `anchore/sbom-action`). They need the Docker CLI + daemon (provided), not
+  host installs.
+- **trivy** is the one exception: `aquasecurity/trivy-action` calls its own
+  `aquasecurity/setup-trivy` step by default on every invocation regardless
+  of a pre-installed system trivy — it never probes for or reuses one. The
+  system trivy baked into this image (table above) only becomes
+  load-bearing once a workflow step passes `skip-setup-trivy: true`; until
+  then it is a defence-in-depth PATH baseline, not a full bypass of
+  setup-trivy's own download. See [kadenz#1186](https://github.com/kadenz-live/kadenz/issues/1186).
 
 ## How the Synology runner consumes it
 
@@ -141,7 +149,7 @@ gh api -X POST repos/kadenz-live/kadenz/actions/runners/registration-token --jq 
 2. **Keep the Kadenz monorepo Ansible role in sync** so the bastion runner
    doesn't drift from the Synology image:
    - `gitleaks` -> `infra/ansible/roles/runner_gitleaks/defaults/main.yml`
-   - `hcloud` / apt packages -> `infra/ansible/roles/runner_toolchain/defaults/main.yml`
+   - `hcloud` / `trivy` / apt packages -> `infra/ansible/roles/runner_toolchain/defaults/main.yml`
    - runner binary -> `infra/ansible/roles/github_runner/defaults/main.yml`
 3. For apt-sourced tools (Node, gh, Playwright libs), the bump is implicit in
    the Ubuntu base-image digest — re-pin the `FROM ubuntu:24.04@sha256:...`
