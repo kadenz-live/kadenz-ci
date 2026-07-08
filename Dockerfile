@@ -42,6 +42,13 @@ ARG GITLEAKS_SHA256=5bc41815076e6ed6ef8fbecc9d9b75bcae31f39029ceb55da08086315316
 ARG HCLOUD_VERSION=1.66.0
 ARG HCLOUD_SHA256=8b1a8598858232c491f58cbf65ce1bd0ec6f725114bb62ec967a20ab03e29a86
 
+# trivy — see infra/ansible/roles/runner_toolchain/defaults/main.yml
+# (kadenz#1186) for the full rationale, including the important caveat
+# that pre-installing trivy alone does not stop aquasecurity/trivy-action
+# from calling its own setup-trivy step by default.
+ARG TRIVY_VERSION=0.72.0
+ARG TRIVY_SHA256=bbb64b9695866ce4a7a8f5c9592002c5961cab378577fa3f8a040df362b9b2ea
+
 # Non-root runner user, per actions-runner convention. UID/GID 1001 keeps it
 # clear of the base image's default `ubuntu` user (UID 1000).
 ARG RUNNER_USER=runner
@@ -198,6 +205,21 @@ RUN set -eux; \
     install -m 0755 hcloud /usr/local/bin/hcloud; \
     rm -f hcloud hcloud.tar.gz; \
     hcloud version
+
+# --- trivy (SHA-256 pinned) -------------------------------------------------
+# Pre-installed system-wide so `trivy` resolves on PATH regardless of
+# aquasecurity/trivy-action's own setup-trivy step (kadenz#1186 —
+# 'trivy: command not found', exit 127, on a subset of bastion
+# kadenz-ci runners). Pinned to match runner_toolchain role defaults.
+RUN set -eux; \
+    cd /tmp; \
+    curl -fsSL -o trivy.tar.gz \
+      "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"; \
+    echo "${TRIVY_SHA256}  trivy.tar.gz" | sha256sum -c -; \
+    tar -xzf trivy.tar.gz trivy; \
+    install -m 0755 trivy /usr/local/bin/trivy; \
+    rm -f trivy trivy.tar.gz; \
+    trivy --version
 
 # --- Non-root runner user --------------------------------------------------
 RUN set -eux; \
