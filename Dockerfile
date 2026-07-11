@@ -274,6 +274,8 @@ WORKDIR ${RUNNER_HOME}/actions-runner
 # user to gosu-drop to without re-deriving it from /etc/passwd.
 ENV RUNNER_USER=${RUNNER_USER}
 
-# Graceful de-registration on container stop is handled inside entrypoint.sh
-# via a SIGTERM/SIGINT trap, which is preserved across the gosu drop.
+# Graceful de-registration is handled inside entrypoint.sh via SIGTERM/SIGINT
+# + EXIT traps (preserved across the gosu drop). The entrypoint also scrubs
+# RUNNER_TOKEN / ACCESS_TOKEN from the environment before the runner starts so
+# job processes never inherit them — see kadenz#890 and README "Security notes".
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
