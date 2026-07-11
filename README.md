@@ -115,7 +115,9 @@ so baking them would be redundant or would fight the version the workflow pins:
 ## How the Docker runner consumes it
 
 Swap the `image:` line in the Docker runner's `docker-compose.yml` from the
-generic image to this one:
+generic image to this one. Two supported operator patterns:
+
+### A) Idempotent, hands-off (recommended) — `ACCESS_TOKEN` only
 
 ```yaml
 services:
@@ -125,13 +127,15 @@ services:
     network_mode: host                            # service-container ports reach the job
     restart: unless-stopped
     environment:
-      RUNNER_URL: https://github.com/kadenz-live/kadenz   # repo-scoped, never org-scoped
+      # Org- OR repo-scoped — auto-detected from the URL shape:
+      #   org-scoped:  https://github.com/<owner>
+      #   repo-scoped: https://github.com/<owner>/<repo>
+      RUNNER_URL: https://github.com/kadenz-live
       RUNNER_LABELS: kadenz-ci                            # gates runs-on: [..., kadenz-ci]
       RUNNER_NAME: docker-runner-1
-      RUNNER_TOKEN: ${RUNNER_TOKEN}                       # single-use registration token
-      # ACCESS_TOKEN: ${ACCESS_TOKEN} # optional PAT: mints a FRESH removal token on stop, so
-      #                               # de-registration works even after the 1h registration-
-      #                               # token expiry (see "Security notes" below)
+      ACCESS_TOKEN: ${ACCESS_TOKEN}                       # PAT: admin:org for org, repo for repo
+      # RUNNER_TOKEN can stay UNSET — the entrypoint mints a fresh registration
+      # token at start via the scope-appropriate REST endpoint.
       # EPHEMERAL: "true"   # optional: de-register after each job for a clean lifecycle
       # RUNNER_GRACEFUL_STOP_TIMEOUT: "60"  # raise together with stop_grace_period
     # stop_grace_period: "90s"  # recommended: docker's 10s default cuts graceful shutdown short
@@ -141,19 +145,86 @@ services:
       # - kadenz-ci-work:/home/runner/actions-runner/_work
 ```
 
-The entrypoint's env interface (`RUNNER_URL` / `RUNNER_TOKEN` / `RUNNER_NAME`
-/ `RUNNER_LABELS` / `EPHEMERAL`) mirrors `myoung34/github-runner`, so the
-existing compose needs little more than the `image:` swap. Get a fresh
-registration token from
-`https://github.com/kadenz-live/kadenz/settings/actions/runners` or:
+### B) Legacy — pre-minted `RUNNER_TOKEN`
 
-```sh
-gh api -X POST repos/kadenz-live/kadenz/actions/runners/registration-token --jq .token
+For deployments that inject a fresh registration token at start time from an
+external secret store, or for backward compatibility with the earlier
+compose shape:
+
+```yaml
+    environment:
+      RUNNER_URL: https://github.com/kadenz-live/kadenz   # repo-scoped shown; org-scoped works identically
+      RUNNER_LABELS: kadenz-ci
+      RUNNER_NAME: docker-runner-1
+      RUNNER_TOKEN: ${RUNNER_TOKEN}                       # single-use, ~1h expiry
+      # ACCESS_TOKEN: ${ACCESS_TOKEN} # optional PAT: mints a FRESH removal token on stop AND
+      #                               # transparently retries config.sh with a fresh registration
+      #                               # token if the supplied one is rejected (see below).
 ```
 
-> The runner is **repo-scoped** to `kadenz-live/kadenz` on purpose — it never
-> registers org-wide, which keeps the blast radius of a compromised workflow to
-> a single repository.
+The entrypoint's env interface (`RUNNER_URL` / `RUNNER_TOKEN` / `RUNNER_NAME`
+/ `RUNNER_LABELS` / `EPHEMERAL`) mirrors `myoung34/github-runner`, so the
+existing compose needs little more than the `image:` swap.
+
+### Idempotent org-scoped registration (kadenz#1256)
+
+**A container recreate after the initial `RUNNER_TOKEN` has expired must not
+require operator intervention.** Registration tokens expire ~1h after mint,
+which means a runner running under `restart: unless-stopped` will crash-loop
+on the next recreate once the token in `.env` has aged out — unless there is
+a way to mint a fresh one at start.
+
+The entrypoint solves this with three coordinated behaviours, all driven by
+the optional `ACCESS_TOKEN` PAT:
+
+1. **Auto-mint at start.** If `RUNNER_TOKEN` is empty (or unset) and
+   `ACCESS_TOKEN` is set, the entrypoint mints a fresh registration token
+   via the scope-appropriate REST endpoint (`/orgs/{owner}/...` or
+   `/repos/{owner}/{repo}/...`, resolved from `RUNNER_URL`) and passes it to
+   `config.sh`. The `.env` file can hold **only** `ACCESS_TOKEN`.
+2. **Transparent one-shot retry.** If `config.sh` rejects the supplied
+   `RUNNER_TOKEN` (expired, migrated scope, or otherwise), the entrypoint
+   mints a fresh registration token via the same endpoint and retries
+   `config.sh` **once**. Failures beyond that are surfaced loud.
+3. **Fresh removal token at stop.** The `SIGTERM` / `EXIT` traps mint a fresh
+   removal token via the scope-appropriate endpoint before calling
+   `config.sh remove` (unchanged behaviour from PR #8; now correctly hits the
+   org endpoint for org-scoped runners).
+
+**URL shapes**:
+
+| Shape                                       | Scope | Registration endpoint                                        | Removal endpoint                                             | Required PAT scope |
+|---------------------------------------------|-------|--------------------------------------------------------------|--------------------------------------------------------------|--------------------|
+| `https://github.com/<owner>`                | org   | `POST /orgs/{owner}/actions/runners/registration-token`      | `POST /orgs/{owner}/actions/runners/remove-token`            | `admin:org` (+ `repo` if the runner will serve private repos) |
+| `https://github.com/<owner>/<repo>`         | repo  | `POST /repos/{owner}/{repo}/actions/runners/registration-token` | `POST /repos/{owner}/{repo}/actions/runners/remove-token` | `repo`             |
+| Anything else                               | —     | —                                                            | —                                                            | Fails loud at start with a docs pointer. |
+
+Endpoints verified against
+`https://docs.github.com/en/rest/actions/self-hosted-runners`
+(GitHub REST API version `2022-11-28`).
+
+`ACCESS_TOKEN` is scrubbed from the environment before `config.sh` / `run.sh`
+run, exactly like `RUNNER_TOKEN` (see [Security notes](#security-notes),
+kadenz#890 S-01), so no job step ever inherits the PAT.
+
+If you don't want the auto-mint path at all, keep the legacy shape from
+subsection (B) above: without `ACCESS_TOKEN`, the entrypoint uses the supplied
+`RUNNER_TOKEN` as-is and best-effort de-registers with it — the pre-PR #8
+behaviour is preserved.
+
+Get a one-off fresh registration token by hand (for the legacy shape):
+
+```sh
+# repo-scoped
+gh api -X POST repos/kadenz-live/kadenz/actions/runners/registration-token --jq .token
+
+# org-scoped
+gh api -X POST orgs/kadenz-live/actions/runners/registration-token --jq .token
+```
+
+> Choose the scope deliberately. Org-scoped runners serve every repository
+> under the org; repo-scoped runners are limited to one repository — a
+> tighter blast radius if a workflow in that repo is ever compromised.
 
 ## Security notes
 
@@ -180,12 +251,22 @@ security review ([kadenz#890](https://github.com/kadenz-live/kadenz/issues/890))
   forwards our stop signal to the listener (upstream mechanism).
 - **Token-freshness limitation.** Registration tokens expire after ~1h, so a
   long-lived runner cannot de-register with its original token. Provide the
-  optional `ACCESS_TOKEN` (PAT with repo-admin) and the entrypoint mints a
-  fresh removal token at stop time via
-  `POST /repos/{owner}/{repo}/actions/runners/remove-token`. Without a PAT,
-  removal past the first hour fails best-effort and the runner lingers as an
-  offline entry until `--replace` (same `RUNNER_NAME`) or manual removal
-  cleans it up — or use `EPHEMERAL=true`, which de-registers after every job.
+  optional `ACCESS_TOKEN` (PAT with `admin:org` for org-scoped runners, or
+  `repo` for repo-scoped) and the entrypoint mints a fresh removal token at
+  stop time via the scope-appropriate endpoint
+  (`POST /orgs/{owner}/actions/runners/remove-token` or
+  `POST /repos/{owner}/{repo}/actions/runners/remove-token`, resolved from
+  `RUNNER_URL`). Without a PAT, removal past the first hour fails best-effort
+  and the runner lingers as an offline entry until `--replace` (same
+  `RUNNER_NAME`) or manual removal cleans it up — or use `EPHEMERAL=true`,
+  which de-registers after every job.
+- **Idempotent container recreates (kadenz#1256).** When `ACCESS_TOKEN` is
+  set, `RUNNER_TOKEN` is optional in `.env`: the entrypoint mints a fresh
+  registration token at start via the scope-appropriate endpoint, and if
+  `config.sh` rejects a supplied `RUNNER_TOKEN` for any reason (expired,
+  scope-migrated, …) it mints a fresh one and retries once transparently.
+  A container recreate past the 1h registration-token expiry no longer
+  crash-loops. See the "Idempotent org-scoped registration" section above.
 - **GID-0 socket guard.** If the bind-mounted docker socket is owned by group
   `root` (gid 0 — a common Docker-host default), the entrypoint does **not** add the
   runner user to the root group (which would grant access to every

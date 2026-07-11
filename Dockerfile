@@ -278,4 +278,8 @@ ENV RUNNER_USER=${RUNNER_USER}
 # + EXIT traps (preserved across the gosu drop). The entrypoint also scrubs
 # RUNNER_TOKEN / ACCESS_TOKEN from the environment before the runner starts so
 # job processes never inherit them — see kadenz#890 and README "Security notes".
+# The entrypoint detects org-scoped vs repo-scoped runners from RUNNER_URL and
+# auto-mints fresh registration + removal tokens from ACCESS_TOKEN when set,
+# so a container recreate past the 1h registration-token expiry is hands-off
+# (kadenz#1256).
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

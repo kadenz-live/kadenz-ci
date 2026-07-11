@@ -13,21 +13,36 @@
 #   root:root 0660, its host GID is unknowable at image-build time, so the
 #   grant must happen at container start once the mount exists.
 #
-#   PHASE 2 (runner) — registers the runner against a repository (repo-scoped,
-#   never org-scoped), starts it, and de-registers gracefully on container
-#   stop. The runner job process never runs as root.
+#   PHASE 2 (runner) — registers the runner against a repository OR an
+#   organization (auto-detected from RUNNER_URL), starts it, and de-registers
+#   gracefully on container stop. The runner job process never runs as root.
 #
 # The env-var interface mirrors myoung34/github-runner closely enough that the
 # Docker runner's compose only has to swap the `image:` line — see README.md.
 #
-# Required env:
-#   RUNNER_TOKEN   GitHub Actions registration token (single-use, 1h expiry).
-#                  Obtain from the repo's Settings -> Actions -> Runners page,
-#                  or mint via `gh api -X POST repos/<owner>/<repo>/actions/runners/registration-token`.
-#                  Scrubbed from the environment before the runner starts so
-#                  job processes never inherit it (kadenz#890 S-01).
-#   RUNNER_URL     Repository URL to register against
-#                  (default: https://github.com/kadenz-live/kadenz).
+# Required env (one of these two combinations):
+#   RUNNER_TOKEN               A pre-minted GitHub Actions registration token
+#                              (single-use, ~1h validity). Legacy path — kept
+#                              for backward compatibility with deployments
+#                              that inject a token from `.env` at start time.
+#   ACCESS_TOKEN               A GitHub PAT with scope matching RUNNER_URL:
+#                              `admin:org` for org-scoped URLs, `repo` for
+#                              repo-scoped URLs. When set, the entrypoint
+#                              mints a fresh registration token at start
+#                              (if RUNNER_TOKEN is empty), automatically
+#                              retries once with a freshly-minted token if
+#                              `config.sh` rejects the supplied one, and mints
+#                              a fresh removal token at stop time — making
+#                              container recreates fully hands-off past the
+#                              1h registration-token expiry (kadenz#1256).
+#                              Both tokens are scrubbed from the environment
+#                              before any job code runs (kadenz#890 S-01).
+#
+#   RUNNER_URL                 Scope URL. Auto-detected:
+#                              * `https://github.com/<owner>`         -> org-scoped
+#                              * `https://github.com/<owner>/<repo>`  -> repo-scoped
+#                              Default: https://github.com/kadenz-live/kadenz.
+#                              Anything else fails loud at start.
 #
 # Optional env:
 #   RUNNER_NAME    Runner name shown in the GitHub UI (default: container host).
@@ -40,15 +55,6 @@
 #   EPHEMERAL      When "true", register with --ephemeral so the runner
 #                  de-registers itself after a single job (recommended for a
 #                  clean, single-use lifecycle). Default: false.
-#   ACCESS_TOKEN   Optional GitHub PAT (myoung34-compatible name) used ONLY to
-#                  mint a fresh removal token at de-registration time.
-#                  Registration tokens expire after ~1h, so a long-lived
-#                  runner can never de-register with the token it registered
-#                  with — providing a PAT makes graceful de-registration
-#                  reliable (kadenz#890 S-03). Needs repo-admin permission
-#                  (classic `repo` scope) per the GitHub REST docs for
-#                  POST /repos/{owner}/{repo}/actions/runners/remove-token.
-#                  Scrubbed from the environment like RUNNER_TOKEN.
 #   RUNNER_GRACEFUL_STOP_TIMEOUT
 #                  Seconds to wait for the runner listener to shut down before
 #                  de-registering on container stop (default: 5). Keep this
@@ -60,6 +66,14 @@
 #                  GID used for the synthetic `dockerhost` group when the
 #                  bind-mounted docker socket is owned by gid 0 (default:
 #                  2375). See the GID-0 note in PHASE 1 (kadenz#890 S-04).
+#
+# Test hook:
+#   KADENZ_CI_ENTRYPOINT_SOURCE_ONLY   Internal. When set to "1" the script
+#                                      defines the helper functions and then
+#                                      returns without running PHASE 1 or 2 —
+#                                      used by tests/smoke.sh to exercise the
+#                                      pure URL-parsing / endpoint helpers.
+#                                      Never set this in a running container.
 
 set -euo pipefail
 
@@ -67,6 +81,103 @@ set -euo pipefail
 # Dockerfile; default kept here so the script is runnable in isolation.
 RUNNER_USER="${RUNNER_USER:-runner}"
 DOCKER_SOCK="${DOCKER_SOCK:-/var/run/docker.sock}"
+
+# ============================================================================
+# Pure helpers (also exercised directly by tests/smoke.sh)
+# ============================================================================
+
+# parse_runner_scope <url>
+#
+# Parse RUNNER_URL into scope kind + owner (+ repo, for repo-scoped). Sets
+# globals _SCOPE_KIND (`org` or `repo`), _SCOPE_OWNER, _SCOPE_REPO (empty
+# string for org-scoped). Returns 0 on match, 1 on anything else — caller
+# decides how to surface the failure so we can format the error message with
+# the actual bad URL.
+#
+# Accepts a trailing slash. Owner/repo character class matches GitHub's own
+# permitted set (alnum plus `.`, `_`, `-`).
+parse_runner_scope() {
+  local url="${1:-}"
+  url="${url%/}"
+  if [[ "${url}" =~ ^https://github\.com/([A-Za-z0-9._-]+)$ ]]; then
+    _SCOPE_KIND="org"
+    _SCOPE_OWNER="${BASH_REMATCH[1]}"
+    _SCOPE_REPO=""
+    return 0
+  fi
+  if [[ "${url}" =~ ^https://github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)$ ]]; then
+    _SCOPE_KIND="repo"
+    _SCOPE_OWNER="${BASH_REMATCH[1]}"
+    _SCOPE_REPO="${BASH_REMATCH[2]}"
+    return 0
+  fi
+  return 1
+}
+
+# scope_endpoint <registration|remove>
+#
+# Print the correct GitHub REST endpoint URL for the current scope + the
+# requested token operation. Requires parse_runner_scope to have been called
+# first (reads _SCOPE_KIND / _SCOPE_OWNER / _SCOPE_REPO). Verified against
+# docs.github.com/rest/actions/self-hosted-runners:
+#
+#   org-scoped   POST /orgs/{org}/actions/runners/(registration|remove)-token
+#   repo-scoped  POST /repos/{owner}/{repo}/actions/runners/(registration|remove)-token
+scope_endpoint() {
+  local op="${1:?scope_endpoint: operation required}"
+  case "${op}" in
+    registration|remove) ;;
+    *) echo "scope_endpoint: unknown op '${op}'" >&2; return 2 ;;
+  esac
+  case "${_SCOPE_KIND:-}" in
+    org)
+      printf 'https://api.github.com/orgs/%s/actions/runners/%s-token\n' \
+        "${_SCOPE_OWNER}" "${op}"
+      ;;
+    repo)
+      printf 'https://api.github.com/repos/%s/%s/actions/runners/%s-token\n' \
+        "${_SCOPE_OWNER}" "${_SCOPE_REPO}" "${op}"
+      ;;
+    *)
+      echo "scope_endpoint: scope not initialized (call parse_runner_scope first)" >&2
+      return 2
+      ;;
+  esac
+}
+
+# mint_token <registration|remove>
+#
+# Mint a fresh registration OR removal token via the GitHub REST API. Reads
+# _ACCESS_TOKEN from the caller's scope. Emits the token on stdout, empty
+# string on failure. Never echoes the token itself to stderr. curl's -fsS
+# makes 4xx/5xx return non-zero without dumping the response body to stdout,
+# and jq's `.token // empty` swallows unexpected shapes.
+#
+# shellcheck disable=SC2329  # invoked directly and indirectly (from cleanup)
+mint_token() {
+  local op="${1:?mint_token: operation required}" endpoint
+  endpoint="$(scope_endpoint "${op}")" || return 1
+  curl -fsS -X POST \
+    -H "Authorization: Bearer ${_ACCESS_TOKEN}" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "${endpoint}" \
+    | jq -r '.token // empty'
+}
+
+# ============================================================================
+# Test-mode short-circuit
+# ============================================================================
+# Sourced by tests/smoke.sh so the harness can call the helpers above without
+# executing PHASE 1 or PHASE 2. `return` works only when sourced; when the
+# script is exec'd normally this variable is unset and the guard is a no-op.
+if [[ "${KADENZ_CI_ENTRYPOINT_SOURCE_ONLY:-0}" == "1" ]]; then
+  # `return` works when this file is sourced by tests/smoke.sh; if the guard
+  # was ever hit in an exec'd container we still want to bail rather than
+  # continue into PHASE 1.
+  # shellcheck disable=SC2317  # unreachable ONLY when sourced; reachable when exec'd
+  { return 0 2>/dev/null || exit 0; }
+fi
 
 # --- PHASE 1: root-only socket-GID grant, then drop to the runner user ------
 # `id -u` == 0 means we are still in the brief root phase. After the gosu
@@ -142,10 +253,18 @@ EPHEMERAL="${EPHEMERAL:-false}"
 RUNNER_GRACEFUL_STOP_TIMEOUT="${RUNNER_GRACEFUL_STOP_TIMEOUT:-5}"
 [[ "${RUNNER_GRACEFUL_STOP_TIMEOUT}" =~ ^[0-9]+$ ]] || RUNNER_GRACEFUL_STOP_TIMEOUT=5
 
-if [[ -z "${RUNNER_TOKEN:-}" ]]; then
-  echo "::error::RUNNER_TOKEN is required (Actions registration token)." >&2
+# --- scope detection --------------------------------------------------------
+# Fail loud before we touch any tokens if RUNNER_URL is neither org nor repo.
+# Points the operator at the docs rather than guessing what they meant.
+if ! parse_runner_scope "${RUNNER_URL}"; then
+  echo "::error::RUNNER_URL '${RUNNER_URL}' does not match either supported shape." >&2
+  echo "::error::  org-scoped:  https://github.com/<owner>" >&2
+  echo "::error::  repo-scoped: https://github.com/<owner>/<repo>" >&2
+  echo "::error::See https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners" >&2
   exit 1
 fi
+# shellcheck disable=SC2016  # inner ${_SCOPE_REPO} inside :+ IS expanded by bash
+echo "Detected runner scope: ${_SCOPE_KIND} (owner='${_SCOPE_OWNER}'${_SCOPE_REPO:+, repo='${_SCOPE_REPO}'})"
 
 # --- token hygiene (kadenz#890 S-01) -----------------------------------------
 # Copy the tokens into UNEXPORTED shell variables and remove the exported
@@ -153,18 +272,50 @@ fi
 # vars are inherited by the Runner.Listener process tree and therefore by
 # every job step it executes; unexported shell variables are not. Within its
 # ~1h validity window a registration token permits attaching an additional
-# runner to the repository, so it must never be visible to job code.
-_REG_TOKEN="${RUNNER_TOKEN}"
+# runner to the scope, so it must never be visible to job code.
+_REG_TOKEN="${RUNNER_TOKEN:-}"
 unset RUNNER_TOKEN
 _ACCESS_TOKEN="${ACCESS_TOKEN:-}"
 unset ACCESS_TOKEN
+
+# --- registration-token acquisition (kadenz#1256) ---------------------------
+# Three-way input handling:
+#
+#   1. RUNNER_TOKEN provided                    -> use it as-is (legacy path).
+#   2. RUNNER_TOKEN empty + ACCESS_TOKEN set    -> auto-mint a fresh one via
+#                                                  the scope-appropriate REST
+#                                                  endpoint. This is the mode
+#                                                  that makes container
+#                                                  recreates hands-off past
+#                                                  the 1h registration-token
+#                                                  expiry (kadenz#1256).
+#   3. Both empty                               -> fail loud at start.
+#
+# Case (2) is the whole point of this branch: a Docker runner running under
+# `restart: unless-stopped` whose original RUNNER_TOKEN has expired should
+# not require the operator to hand-mint a token every recreate — the PAT does
+# that on its behalf. The PAT itself never reaches job code because
+# ACCESS_TOKEN is already scrubbed above.
+if [[ -z "${_REG_TOKEN}" ]]; then
+  if [[ -z "${_ACCESS_TOKEN}" ]]; then
+    echo "::error::Neither RUNNER_TOKEN nor ACCESS_TOKEN is set." >&2
+    echo "::error::Provide RUNNER_TOKEN (single-use, ~1h expiry) OR ACCESS_TOKEN (PAT with '${_SCOPE_KIND}'-appropriate scope: admin:org for org, repo for repo) so a fresh registration token can be minted at start." >&2
+    exit 1
+  fi
+  echo "RUNNER_TOKEN is empty — minting a fresh ${_SCOPE_KIND}-scoped registration token via the GitHub API..."
+  _REG_TOKEN="$(mint_token registration || true)"
+  if [[ -z "${_REG_TOKEN}" ]]; then
+    echo "::error::Auto-mint failed. Verify the PAT has the required scope (admin:org for org runners, repo for repo runners), that the ${_SCOPE_KIND} '${_SCOPE_OWNER}${_SCOPE_REPO:+/${_SCOPE_REPO}}' exists, and that api.github.com is reachable." >&2
+    exit 1
+  fi
+fi
 
 # RUNNER_HOME is baked as an ENV by the Dockerfile (/home/runner). Prefer it
 # over $HOME so we don't depend on gosu/libcontainer having reset $HOME to the
 # target user's passwd home during the privilege drop.
 cd "${RUNNER_HOME:-${HOME}}/actions-runner"
 
-# --- graceful stop + de-registration (kadenz#890 S-03) -----------------------
+# --- graceful stop + de-registration (kadenz#890 S-03, kadenz#1256) ----------
 # Covers three paths:
 #   * SIGTERM/SIGINT (docker stop / compose down) — signal trap, then
 #   * ANY script exit, including run.sh crashing on its own — EXIT trap,
@@ -178,27 +329,19 @@ cd "${RUNNER_HOME:-${HOME}}/actions-runner"
 # non-ephemeral runner that has been up longer (the normal case under
 # `restart: unless-stopped`) the original token can no longer authenticate
 # the removal. If ACCESS_TOKEN (PAT) is provided we mint a FRESH removal
-# token at trap time via
-#   POST /repos/{owner}/{repo}/actions/runners/remove-token
-# (1h validity, per GitHub REST docs). Without a PAT we fall back to the
-# original registration token best-effort and document the limitation: past
-# the first hour the removal will fail and the runner lingers as an offline
-# entry until `--replace` (same RUNNER_NAME) or a manual removal cleans it up.
+# token at trap time via the scope-appropriate endpoint (org vs repo,
+# resolved by scope_endpoint). Without a PAT we fall back to the original
+# registration token best-effort and document the limitation: past the first
+# hour the removal will fail and the runner lingers as an offline entry until
+# `--replace` (same RUNNER_NAME) or a manual removal cleans it up.
 RUNNER_PID=""
 CLEANUP_DONE="false"
 
 # shellcheck disable=SC2329  # invoked indirectly (from cleanup, itself trap-invoked)
 fetch_removal_token() {
-  # Derive owner/repo from RUNNER_URL (https://github.com/<owner>/<repo>).
-  local repo_path
-  repo_path="${RUNNER_URL#https://github.com/}"
-  repo_path="${repo_path%/}"
-  curl -fsS -X POST \
-    -H "Authorization: Bearer ${_ACCESS_TOKEN}" \
-    -H "Accept: application/vnd.github+json" \
-    -H "X-GitHub-Api-Version: 2022-11-28" \
-    "https://api.github.com/repos/${repo_path}/actions/runners/remove-token" \
-    | jq -r '.token // empty'
+  # Thin wrapper preserved for readability at the call site; the scope-aware
+  # logic lives in mint_token / scope_endpoint above.
+  mint_token remove
 }
 
 # shellcheck disable=SC2329  # invoked via the EXIT trap and on_stop_signal
@@ -226,10 +369,10 @@ cleanup() {
   # (2) De-register with the freshest token available.
   local remove_token=""
   if [[ -n "${_ACCESS_TOKEN}" ]]; then
-    echo "Minting a fresh removal token via the GitHub API..."
+    echo "Minting a fresh ${_SCOPE_KIND}-scoped removal token via the GitHub API..."
     remove_token="$(fetch_removal_token || true)"
     [[ -z "${remove_token}" ]] && \
-      echo "Could not mint a removal token (PAT lacks repo-admin, or API unreachable) — falling back to the registration token." >&2
+      echo "Could not mint a removal token (PAT lacks the required scope, or API unreachable) — falling back to the registration token." >&2
   fi
   if [[ -z "${remove_token}" ]]; then
     # Known limitation: registration tokens expire after ~1h. For a runner
@@ -271,23 +414,47 @@ trap cleanup EXIT
 # the process argument vector. Registration happens before any job runs, so
 # no untrusted same-UID reader exists at this point; the environment scrub
 # above (S-01) plus the token's 1h expiry bound the remaining exposure.
-CONFIG_ARGS=(
-  --url "${RUNNER_URL}"
-  --token "${_REG_TOKEN}"
-  --name "${RUNNER_NAME}"
-  --labels "${RUNNER_LABELS}"
-  --runnergroup "${RUNNER_GROUP}"
-  --work "${RUNNER_WORKDIR}"
-  --unattended
-  --replace
-  --disableupdate
-)
-if [[ "${EPHEMERAL}" == "true" ]]; then
-  CONFIG_ARGS+=(--ephemeral)
-fi
+build_config_args() {
+  CONFIG_ARGS=(
+    --url "${RUNNER_URL}"
+    --token "${_REG_TOKEN}"
+    --name "${RUNNER_NAME}"
+    --labels "${RUNNER_LABELS}"
+    --runnergroup "${RUNNER_GROUP}"
+    --work "${RUNNER_WORKDIR}"
+    --unattended
+    --replace
+    --disableupdate
+  )
+  if [[ "${EPHEMERAL}" == "true" ]]; then
+    CONFIG_ARGS+=(--ephemeral)
+  fi
+}
 
+build_config_args
 echo "Registering runner '${RUNNER_NAME}' (labels: ${RUNNER_LABELS}) against ${RUNNER_URL}"
-./config.sh "${CONFIG_ARGS[@]}"
+if ! ./config.sh "${CONFIG_ARGS[@]}"; then
+  # config.sh refused. Common causes: the supplied RUNNER_TOKEN is expired
+  # (>1h since mint), the runner name is already-registered against a
+  # different scope after a migration (repo -> org), or the API rejected the
+  # token for another reason. If ACCESS_TOKEN is available, mint a fresh
+  # registration token and retry ONCE — transparently, so a container
+  # recreate after a token expiry does not crash-loop (kadenz#1256).
+  if [[ -z "${_ACCESS_TOKEN}" ]]; then
+    echo "::error::config.sh failed and ACCESS_TOKEN is not set — cannot auto-recover. Provide a fresh RUNNER_TOKEN or a PAT." >&2
+    exit 1
+  fi
+  echo "config.sh refused the supplied registration token. Minting a fresh ${_SCOPE_KIND}-scoped token and retrying once..."
+  fresh="$(mint_token registration || true)"
+  if [[ -z "${fresh}" ]]; then
+    echo "::error::Fresh registration-token mint failed on retry — giving up." >&2
+    exit 1
+  fi
+  _REG_TOKEN="${fresh}"
+  unset fresh
+  build_config_args
+  ./config.sh "${CONFIG_ARGS[@]}"
+fi
 
 # run.sh in the background + `wait` so the traps can fire on signal.
 # RUNNER_MANUALLY_TRAP_SIG makes run.sh run the listener in the background
