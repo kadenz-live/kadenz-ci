@@ -79,7 +79,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - name: Checkout (full history + tags)
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           # fetch-depth: 0 + tags so `git tag --sort=-v:refname` sees the full
           # tag history to compute the next patch, and so the git-cliff
@@ -244,7 +244,7 @@ jobs:
       contents: write # commit the regenerated CHANGELOG.md back to main
     steps:
       - name: Checkout main (full history + tags)
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: main
           # Full history + the freshly-created tag so git-cliff can render the
