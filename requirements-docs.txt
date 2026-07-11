@@ -1,0 +1,4 @@
+# Docs-site toolchain — pinned exactly so local builds and the Pages workflow
+# resolve the identical version (same pinning discipline as the Dockerfile).
+# mkdocs-material pins its own compatible mkdocs/pymdown-extensions range.
+mkdocs-material==9.7.6

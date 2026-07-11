@@ -1,0 +1,59 @@
+site_name: kadenz-ci
+site_description: >-
+  Self-hosted GitHub Actions runner image for the Kadenz CI pool —
+  ghcr.io/kadenz-live/ci
+site_url: https://kadenz-live.github.io/kadenz-ci/
+repo_url: https://github.com/kadenz-live/kadenz-ci
+repo_name: kadenz-live/kadenz-ci
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    # Light ("default") and dark ("slate") schemes with a manual toggle;
+    # the media queries make the initial scheme follow the OS preference.
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - content.code.copy
+    - content.action.edit
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  # snippets lets docs/changelog.md transclude the repo-root CHANGELOG.md so
+  # the released changelog is published without duplicating its content.
+  - pymdownx.snippets:
+      base_path: [".", "docs"]
+      check_paths: true
+
+nav:
+  - Home: index.md
+  - Configuration: configuration.md
+  - Deployment patterns: deployment.md
+  - Security: security.md
+  - Supply chain: supply-chain.md
+  - Changelog: changelog.md

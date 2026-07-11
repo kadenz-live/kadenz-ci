@@ -37,7 +37,7 @@ on:
   # cron, so the wall-clock Berlin time shifts by an hour twice a year. 03:00
   # UTC is chosen so the daily security-patch rebuild lands in the early
   # German morning either way, before the working day. Every scheduled run
-  # cuts a fresh PATCH so a restart of the Synology runners picks up that
+  # cuts a fresh PATCH so a restart of the Docker runners picks up that
   # day's base-image security updates even with zero code change.
   schedule:
     - cron: "0 3 * * *"
@@ -147,7 +147,7 @@ jobs:
           # patterns work on push/schedule/dispatch identically (there is no
           # git-tag event here — we cut the tag AFTER the build). This yields:
           #   :vX.Y.Z  (immutable full version)
-          #   :X.Y     (minor float — the Synology runners pin to this)
+          #   :X.Y     (minor float — the Docker runners pin to this)
           #   :X       (major float)
           #   :latest  (newest release)
           #   :sha-<full-sha>
@@ -169,7 +169,7 @@ jobs:
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
-          # amd64 only — bastion + Synology runners are x86_64. arm64 would
+          # amd64 only — all runner hosts are x86_64. arm64 would
           # only pay off for an arm runner host, of which there are none.
           platforms: linux/amd64
           push: true

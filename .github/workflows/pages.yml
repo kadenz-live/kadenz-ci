@@ -1,0 +1,85 @@
+name: Docs
+
+# Builds the MkDocs Material site and deploys it to GitHub Pages
+# (https://kadenz-live.github.io/kadenz-ci/). Pages is configured repo-side
+# with build_type=workflow, so this workflow IS the publish path.
+#
+# Runs on GitHub-hosted ubuntu-latest — free on a public repo, and the docs
+# build has no need for the self-hosted kadenz-ci pool.
+#
+# Action SHA-pinning + permissions hardening mirror build.yml.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - "requirements-docs.txt"
+      - ".github/workflows/pages.yml"
+      # The changelog page transcludes CHANGELOG.md, which the release
+      # pipeline commits back to main — republish the site when it changes.
+      - "CHANGELOG.md"
+  workflow_dispatch:
+
+# Workflow-level least-privilege baseline: read-only. The deploy job widens
+# its own scope explicitly below.
+permissions:
+  contents: read
+
+concurrency:
+  # One Pages deployment at a time; a newer push supersedes an in-flight
+  # build (docs are stateless — cancelling is safe, unlike releases).
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build docs site
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-docs.txt
+
+      - name: Install docs toolchain
+        run: pip install -r requirements-docs.txt
+
+      - name: Build (strict)
+        # --strict turns MkDocs warnings (broken links, missing nav pages,
+        # missing snippet includes) into build failures.
+        run: mkdocs build --strict
+
+      - name: Configure Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write # deploy the artifact to Pages
+      # id-token: write lets deploy-pages mint the short-lived OIDC token that
+      # authenticates the deployment to the Pages service (scoped to this
+      # environment) — no long-lived credential involved.
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

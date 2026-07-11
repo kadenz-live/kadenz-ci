@@ -1,0 +1,5 @@
+# MkDocs build output (published via .github/workflows/pages.yml, never committed)
+site/
+
+# macOS
+.DS_Store

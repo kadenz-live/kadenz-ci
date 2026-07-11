@@ -5,20 +5,20 @@
 # This image bakes the full toolchain the kadenz-live/kadenz workflows assume
 # pre-installed on a runner labelled `kadenz-ci`
 # (`runs-on: [self-hosted, Linux, X64, kadenz-ci]`). It replaces the generic
-# `myoung34/github-runner:latest` image used by the Synology runners, which
+# `myoung34/github-runner:latest` image used by the Docker runners, which
 # lacks gitleaks, the Playwright system libs, the native-gem build chain, etc.
 #
 # Source-of-truth for the pinned versions below is the Kadenz monorepo's
-# Ansible roles, which provision the bastion runners identically:
+# Ansible roles, which provision the bare-metal / VM runners identically:
 #   infra/ansible/roles/github_runner/defaults/main.yml   (runner binary + SHA)
 #   infra/ansible/roles/runner_toolchain/defaults/main.yml (apt pkgs, hcloud)
 #   infra/ansible/roles/runner_gitleaks/defaults/main.yml  (gitleaks + SHA)
 # Keep this image and those roles in lock-step so a `kadenz-ci` job behaves
-# identically whether it lands on the bastion or a Synology runner.
+# identically whether it lands on a bare-metal / VM runner or a Docker runner.
 #
-# Target platform: linux/amd64 only (bastion + Synology are x86_64).
+# Target platform: linux/amd64 only (all runner hosts are x86_64).
 
-# Ubuntu 24.04 (noble) base — matches the bastion runner's host OS, so the
+# Ubuntu 24.04 (noble) base — matches the bare-metal / VM runner's host OS, so the
 # Playwright `nativeDeps` package names (the `t64` time64 ABI variants) and
 # the `libvips42` package resolve identically. Pinned by digest, not by the
 # floating `:24.04` tag, so a base-image refresh is an explicit, reviewable
@@ -148,8 +148,8 @@ RUN set -eux; \
 # --- Docker CLI + buildx ---------------------------------------------------
 # Jobs use service containers (postgres/redis in api.yml) and the release
 # build-push-action talks to a Docker daemon. We install ONLY the client +
-# buildx plugin — the daemon is provided by the host (the Synology compose
-# bind-mounts /var/run/docker.sock; the bastion runs dockerd). Installed from
+# buildx plugin — the daemon is provided by the host (the Docker runner's compose
+# bind-mounts /var/run/docker.sock; the bare-metal / VM runner runs dockerd). Installed from
 # the official Docker apt repo, pinned to the noble channel.
 RUN set -eux; \
     install -m 0755 -d /etc/apt/keyrings; \
@@ -194,7 +194,7 @@ RUN set -eux; \
     gitleaks version
 
 # --- hcloud CLI (SHA-256 pinned) -------------------------------------------
-# ansible.yml's "Discover server IPs from Hetzner" step shells out to hcloud.
+# IaC workflows shell out to `hcloud` for server discovery.
 # Pinned to match runner_toolchain role defaults.
 RUN set -eux; \
     cd /tmp; \
@@ -209,7 +209,7 @@ RUN set -eux; \
 # --- trivy (SHA-256 pinned) -------------------------------------------------
 # Pre-installed system-wide so `trivy` resolves on PATH regardless of
 # aquasecurity/trivy-action's own setup-trivy step (kadenz#1186 —
-# 'trivy: command not found', exit 127, on a subset of bastion
+# 'trivy: command not found', exit 127, on a subset of
 # kadenz-ci runners). Pinned to match runner_toolchain role defaults.
 RUN set -eux; \
     cd /tmp; \
@@ -231,7 +231,7 @@ RUN set -eux; \
     chown -R "${RUNNER_USER}:${RUNNER_USER}" "${AGENT_TOOLSDIRECTORY}"
 
 # --- actions/runner binary (SHA-256 pinned) --------------------------------
-# Pinned to match github_runner role defaults so bastion + Synology run the
+# Pinned to match github_runner role defaults so all runner hosts run the
 # identical runner version.
 RUN set -eux; \
     mkdir -p "${RUNNER_HOME}/actions-runner"; \
@@ -249,7 +249,7 @@ RUN set -eux; \
 
 # --- Entrypoint ------------------------------------------------------------
 # config.sh / run.sh registration + start is handled by this script. It is a
-# thin wrapper so the Synology compose can pass RUNNER_TOKEN / RUNNER_URL /
+# thin wrapper so the Docker runner's compose can pass RUNNER_TOKEN / RUNNER_URL /
 # RUNNER_NAME / RUNNER_LABELS as env, mirroring the myoung34 interface this
 # image replaces.
 COPY --chown=${RUNNER_USER}:${RUNNER_USER} entrypoint.sh /usr/local/bin/entrypoint.sh
