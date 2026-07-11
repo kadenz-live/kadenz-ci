@@ -1,5 +1,11 @@
 # kadenz-ci
 
+[![Build image](https://github.com/kadenz-live/kadenz-ci/actions/workflows/build.yml/badge.svg)](https://github.com/kadenz-live/kadenz-ci/actions/workflows/build.yml)
+[![Docs](https://github.com/kadenz-live/kadenz-ci/actions/workflows/pages.yml/badge.svg)](https://kadenz-live.github.io/kadenz-ci/)
+[![Release](https://img.shields.io/github/v/release/kadenz-live/kadenz-ci?logo=github)](https://github.com/kadenz-live/kadenz-ci/releases/latest)
+[![Image](https://img.shields.io/badge/ghcr.io-kadenz--live%2Fci-0db7ed?logo=docker&logoColor=white)](https://github.com/kadenz-live/kadenz-ci/pkgs/container/ci)
+[![License: MIT](https://img.shields.io/github/license/kadenz-live/kadenz-ci)](LICENSE)
+
 Custom self-hosted **GitHub Actions runner image** for the Kadenz CI pool.
 Published as **`ghcr.io/kadenz-live/ci`** (short image name; this repo stays `kadenz-ci`).
 
@@ -19,6 +25,9 @@ fail with `gitleaks: command not found`, tflint download timeouts, and missing
 > This repository and the published image are intended to be made **public**.
 > No secrets live here — only a Dockerfile, an entrypoint, a build workflow,
 > and docs.
+
+Full documentation (configuration reference, deployment patterns, security
+model, supply chain): **<https://kadenz-live.github.io/kadenz-ci/>**.
 
 ## Image reference
 
