@@ -8,7 +8,7 @@
 #   non-root `runner` user access to the bind-mounted host Docker socket by
 #   creating a group matching the socket's host GID and adding `runner` to it,
 #   then drops to `runner` via `gosu` and re-execs this same script. This is
-#   the fix for the Synology runners failing RSpec with
+#   the fix for the Docker runners failing RSpec with
 #   `permission denied … /var/run/docker.sock`: the socket is bind-mounted
 #   root:root 0660, its host GID is unknowable at image-build time, so the
 #   grant must happen at container start once the mount exists.
@@ -18,7 +18,7 @@
 #   stop. The runner job process never runs as root.
 #
 # The env-var interface mirrors myoung34/github-runner closely enough that the
-# Synology compose only has to swap the `image:` line — see README.md.
+# Docker runner's compose only has to swap the `image:` line — see README.md.
 #
 # Required env:
 #   RUNNER_TOKEN   GitHub Actions registration token (single-use, 1h expiry).
@@ -80,7 +80,7 @@ if [[ "$(id -u)" -eq 0 ]]; then
 
     if [[ "${SOCK_GID}" -eq 0 ]]; then
       # GID-0 edge case (kadenz#890 S-04): the socket is owned by group root
-      # (root:root 0660 — the Synology default). Adding `runner` to gid 0
+      # (root:root 0660 — a common Docker-host default). Adding `runner` to gid 0
       # would grant it group-level access to EVERY group-0-writable path in
       # the image, far beyond the socket. Instead, re-group the socket onto a
       # dedicated synthetic gid and grant membership in that group only.

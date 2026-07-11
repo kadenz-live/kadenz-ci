@@ -6,10 +6,10 @@ Published as **`ghcr.io/kadenz-live/ci`** (short image name; this repo stays `ka
 It bakes the full toolchain that the [`kadenz-live/kadenz`](https://github.com/kadenz-live/kadenz)
 workflows assume is pre-installed on a runner labelled `kadenz-ci`
 (`runs-on: [self-hosted, Linux, X64, kadenz-ci]`), so a CI job behaves
-**identically whether it lands on the Hetzner bastion runner or a Synology
-NAS runner**.
+**identically whether it lands on a bare-metal / VM runner (systemd-based)
+or a Docker runner (containerized, docker-compose based)**.
 
-It **replaces `myoung34/github-runner:latest`** on the Synology runners. The
+It **replaces `myoung34/github-runner:latest`** on the Docker runners. The
 generic image lacks `gitleaks`, `tflint`'s download prerequisites, the
 Playwright/chromium system libraries, and the native-gem build chain, so jobs
 fail with `gitleaks: command not found`, tflint download timeouts, and missing
@@ -28,7 +28,7 @@ dispatch) cuts a new **patch** and publishes the full tag set:
 
 ```
 ghcr.io/kadenz-live/ci:vX.Y.Z          # immutable full version (also a git tag + GitHub Release)
-ghcr.io/kadenz-live/ci:X.Y             # minor float — auto-updates to the newest patch (Synology pins here)
+ghcr.io/kadenz-live/ci:X.Y             # minor float — auto-updates to the newest patch (Docker runners pin here)
 ghcr.io/kadenz-live/ci:X               # major float
 ghcr.io/kadenz-live/ci:latest          # newest release
 ghcr.io/kadenz-live/ci:sha-<gitsha>    # immutable, pin to an exact commit
@@ -61,13 +61,13 @@ cosign verify \
 ## What's baked in
 
 The pinned versions mirror the Kadenz monorepo's Ansible roles that provision
-the bastion runner, so the two stay in lock-step:
+the bare-metal / VM runner, so the two stay in lock-step:
 
 | Component | Version | Source-of-truth (monorepo role) | Why |
 | --- | --- | --- | --- |
-| actions/runner | `2.335.1` (SHA-256 pinned) | `roles/github_runner/defaults/main.yml` | The runner agent itself; matches the bastion. |
+| actions/runner | `2.335.1` (SHA-256 pinned) | `roles/github_runner/defaults/main.yml` | The runner agent itself; matches the bare-metal / VM runner. |
 | gitleaks | `8.21.2` (SHA-256 pinned) | `roles/runner_gitleaks/defaults/main.yml` | `gitleaks.yml` runs the binary directly. |
-| hcloud CLI | `1.66.0` (SHA-256 pinned) | `roles/runner_toolchain/defaults/main.yml` | `ansible.yml` discovers Hetzner server IPs. |
+| hcloud CLI | `1.66.0` (SHA-256 pinned) | `roles/runner_toolchain/defaults/main.yml` | IaC workflows shell out to `hcloud` for server discovery. |
 | trivy | `0.72.0` (SHA-256 pinned) | `roles/runner_toolchain/defaults/main.yml` | Pre-installed so `trivy` resolves on PATH baseline; see the caveat below and [kadenz#1186](https://github.com/kadenz-live/kadenz/issues/1186). |
 | Docker CLI + buildx + compose plugins | apt (noble `stable`) | — | Service containers (`api.yml`) + image builds (`release.yml`). Daemon is host-provided. |
 | Node.js | apt (Ubuntu noble) | `roles/runner_toolchain/defaults/main.yml` | JS composite actions (`setup-terraform` wrapper, `setup-tflint`) need a system `node`. |
@@ -103,9 +103,9 @@ so baking them would be redundant or would fight the version the workflow pins:
   then it is a defence-in-depth PATH baseline, not a full bypass of
   setup-trivy's own download. See [kadenz#1186](https://github.com/kadenz-live/kadenz/issues/1186).
 
-## How the Synology runner consumes it
+## How the Docker runner consumes it
 
-Swap the `image:` line in the Synology runner's `docker-compose.yml` from the
+Swap the `image:` line in the Docker runner's `docker-compose.yml` from the
 generic image to this one:
 
 ```yaml
@@ -118,7 +118,7 @@ services:
     environment:
       RUNNER_URL: https://github.com/kadenz-live/kadenz   # repo-scoped, never org-scoped
       RUNNER_LABELS: kadenz-ci                            # gates runs-on: [..., kadenz-ci]
-      RUNNER_NAME: synology-ci-1
+      RUNNER_NAME: docker-runner-1
       RUNNER_TOKEN: ${RUNNER_TOKEN}                       # single-use registration token
       # ACCESS_TOKEN: ${ACCESS_TOKEN} # optional PAT: mints a FRESH removal token on stop, so
       #                               # de-registration works even after the 1h registration-
@@ -178,7 +178,7 @@ security review ([kadenz#890](https://github.com/kadenz-live/kadenz/issues/890))
   offline entry until `--replace` (same `RUNNER_NAME`) or manual removal
   cleans it up — or use `EPHEMERAL=true`, which de-registers after every job.
 - **GID-0 socket guard.** If the bind-mounted docker socket is owned by group
-  `root` (gid 0 — the Synology default), the entrypoint does **not** add the
+  `root` (gid 0 — a common Docker-host default), the entrypoint does **not** add the
   runner user to the root group (which would grant access to every
   group-0-writable path in the image). It re-groups the socket onto a
   dedicated `dockerhost` group (`DOCKER_SOCK_SYNTHETIC_GID`, default 2375)
@@ -197,8 +197,8 @@ security review ([kadenz#890](https://github.com/kadenz-live/kadenz/issues/890))
 1. Edit the matching `ARG` in [`Dockerfile`](Dockerfile) (version **and**
    SHA-256 together). Copy the checksum from the tool's official release-asset
    checksums file.
-2. **Keep the Kadenz monorepo Ansible role in sync** so the bastion runner
-   doesn't drift from the Synology image:
+2. **Keep the Kadenz monorepo Ansible role in sync** so the bare-metal / VM
+   runner doesn't drift from this image:
    - `gitleaks` -> `infra/ansible/roles/runner_gitleaks/defaults/main.yml`
    - `hcloud` / `trivy` / apt packages -> `infra/ansible/roles/runner_toolchain/defaults/main.yml`
    - runner binary -> `infra/ansible/roles/github_runner/defaults/main.yml`
@@ -207,17 +207,18 @@ security review ([kadenz#890](https://github.com/kadenz-live/kadenz/issues/890))
    digest deliberately when you want a refresh.
 4. Push to `main`; `build.yml` cuts a new patch `vX.Y.(Z+1)` and republishes
    the `:X.Y` minor float (plus `:vX.Y.Z`, `:X`, `:latest`, `:sha-<gitsha>`).
-5. The Synology hosts pin the `:X.Y` minor float with `pull_policy: always`, so
+5. The Docker runner hosts pin the `:X.Y` minor float with `pull_policy: always`, so
    a `docker compose up -d` / restart re-pulls the newest patch automatically —
    no manual `docker compose pull` needed. Bumping to a new **minor** is a
    deliberate pin change in the compose.
 
-## Relationship to the bastion runner
+## Relationship to the bare-metal / VM runner
 
-The Hetzner bastion runner is provisioned **bare-metal** by the Kadenz monorepo
-Ansible roles (`github_runner` + `runner_toolchain` + `runner_gitleaks`), not by
-this image. This image is the **container-based equivalent** for the Synology
-NAS runners. The pinned versions above are kept identical between the two so a
+The bare-metal / VM runner is provisioned **directly on the host** (systemd
+service) by the Kadenz monorepo Ansible roles (`github_runner` +
+`runner_toolchain` + `runner_gitleaks`), not by this image. This image is the
+**container-based equivalent** for the Docker runners.
+The pinned versions above are kept identical between the two so a
 `kadenz-ci` job is reproducible regardless of which runner picks it up. If you
 bump one, bump the other.
 
