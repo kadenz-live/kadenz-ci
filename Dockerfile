@@ -27,7 +27,7 @@
 # Manifest-list digest for ubuntu:24.04, resolved 2026-06-30 (buildx selects
 # the linux/amd64 child automatically). Re-pin on a deliberate base bump:
 # `docker buildx imagetools inspect ubuntu:24.04`.
-FROM ubuntu:24.04@sha256:786a8b558f7be160c6c8c4a54f9a57274f3b4fb1491cf65146521ae77ff1dc54
+FROM ubuntu:25.10@sha256:7cc5e35f6567ee8c66d2abb4aab0fd866669e6207c237c3a8f0947a5c7f17092
 
 # --- Build-time pins -------------------------------------------------------
 # Mirror infra/ansible/roles/*/defaults/main.yml. Bump version + checksum
