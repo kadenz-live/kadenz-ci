@@ -1,0 +1,79 @@
+name: Test
+
+# Shell test gate for entrypoint.sh and its smoke suite.
+#
+# This exists because `tests/smoke.sh` was added without a runner: a suite that
+# is never executed is worse than no suite, because its presence reads as
+# coverage. Every change to the entrypoint now has to pass it.
+#
+# Runs on GitHub-hosted `ubuntu-latest` for the same reason build.yml documents:
+# the self-hosted runners this image powers are scoped to kadenz-live/kadenz,
+# not to this repo, so this repo's own pipeline must not depend on them. This
+# repo is public, so GitHub-hosted minutes are free here — the standing
+# "Linux always on kadenz-ci" cost rule applies to the private monorepo.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "CHANGELOG.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shell:
+    name: shellcheck + entrypoint smoke tests
+    runs-on: ubuntu-latest
+    # The suite stubs curl/config.sh/run.sh and touches no network, so it is
+    # seconds, not minutes. A ceiling this tight surfaces a hang as a failure
+    # rather than as a six-hour default.
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Syntax-check every shell script
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r f; do
+            echo "bash -n $f"
+            bash -n "$f" || fail=1
+          done < <(git ls-files '*.sh')
+          exit "$fail"
+
+      - name: shellcheck
+        # PINNED, not apt. Ubuntu's package is 0.9.x, where trap-invoked
+        # handlers trip SC2317 ("command appears to be unreachable"); 0.11
+        # retired that in favour of SC2329, which entrypoint.sh already
+        # carries a scoped, explained disable for. Running whatever the
+        # runner image happens to ship means the gate's verdict depends on
+        # the base image rather than on the code — this job went red on
+        # exactly that. The checksum is verified so a replaced release
+        # asset cannot silently change what the gate enforces.
+        env:
+          SHELLCHECK_VERSION: "0.11.0"
+          SHELLCHECK_SHA256: "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198"
+        run: |
+          set -euo pipefail
+          url="https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -fsSL -o shellcheck.tar.xz "$url"
+          echo "${SHELLCHECK_SHA256}  shellcheck.tar.xz" | sha256sum -c -
+          tar -xJf shellcheck.tar.xz
+          sc="shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+          "$sc" --version
+          # The tree is already clean at this version; keep it that way
+          # rather than accumulating a suppression list.
+          git ls-files '*.sh' | xargs -r "$sc"
+
+      - name: entrypoint smoke tests
+        # No network is touched: curl, config.sh and run.sh are stubbed by the
+        # suite itself, so this can never mint a real registration token.
+        run: bash tests/smoke.sh
